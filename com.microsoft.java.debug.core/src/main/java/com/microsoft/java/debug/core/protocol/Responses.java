@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright (c) 2017 Microsoft Corporation and others.
+* Copyright (c) 2017-2019 Microsoft Corporation and others.
 * All rights reserved. This program and the accompanying materials
 * are made available under the terms of the Eclipse Public License v1.0
 * which accompanies this distribution, and is available at
@@ -12,6 +12,11 @@
 package com.microsoft.java.debug.core.protocol;
 
 import java.util.List;
+
+import com.microsoft.java.debug.core.protocol.Types.DataBreakpointAccessType;
+import com.microsoft.java.debug.core.protocol.Types.ExceptionBreakMode;
+import com.microsoft.java.debug.core.protocol.Types.ExceptionDetails;
+import com.microsoft.java.debug.core.protocol.Types.Variable;
 
 /**
  * The response content types defined by VSCode Debug Protocol.
@@ -204,6 +209,56 @@ public class Responses {
         }
     }
 
+    public static class SetDataBreakpointsResponseBody extends SetBreakpointsResponseBody {
+        public SetDataBreakpointsResponseBody(List<Types.Breakpoint> bpts) {
+            super(bpts);
+        }
+    }
+
+    public static class DataBreakpointInfoResponseBody extends ResponseBody {
+        /**
+         * An identifier for the data on which a data breakpoint can be registered with the setDataBreakpoints request
+         * or null if no data breakpoint is available.
+         */
+        public String dataId;
+        /**
+         * UI string that describes on what data the breakpoint is set on or why a data breakpoint is not available.
+         */
+        public String description;
+        /**
+         * Optional attribute listing the available access types for a potential data breakpoint. A UI frontend could surface this information.
+         */
+        public DataBreakpointAccessType[] accessTypes;
+        /**
+         * Optional attribute indicating that a potential data breakpoint could be persisted across sessions.
+         */
+        public boolean canPersist;
+
+        public DataBreakpointInfoResponseBody(String dataId) {
+            this(dataId, null);
+        }
+
+        public DataBreakpointInfoResponseBody(String dataId, String description) {
+            this(dataId, description, null);
+        }
+
+        public DataBreakpointInfoResponseBody(String dataId, String description,
+                DataBreakpointAccessType[] accessTypes) {
+            this(dataId, description, accessTypes, false);
+        }
+
+        /**
+         * Constructor.
+         */
+        public DataBreakpointInfoResponseBody(String dataId, String description, DataBreakpointAccessType[] accessTypes,
+                boolean canPersist) {
+            this.dataId = dataId;
+            this.description = description;
+            this.accessTypes = accessTypes;
+            this.canPersist = canPersist;
+        }
+    }
+
     public static class ContinueResponseBody extends ResponseBody {
         public boolean allThreadsContinued;
 
@@ -216,6 +271,58 @@ public class Responses {
          */
         public ContinueResponseBody(boolean allThreadsContinued) {
             this.allThreadsContinued = allThreadsContinued;
+        }
+    }
+
+    public static class ExceptionInfoResponse extends ResponseBody {
+        public String exceptionId;
+        public String description;
+        public ExceptionBreakMode breakMode;
+        public ExceptionDetails details;
+
+        /**
+         * Constructs a ExceptionInfoResponse.
+         */
+        public ExceptionInfoResponse(String exceptionId, String description, ExceptionBreakMode breakMode) {
+            this.exceptionId = exceptionId;
+            this.description = description;
+            this.breakMode = breakMode;
+        }
+
+        /**
+         * Constructs a ExceptionInfoResponse.
+         */
+        public ExceptionInfoResponse(String exceptionId, String description, ExceptionBreakMode breakMode, ExceptionDetails details) {
+            this(exceptionId, description, breakMode);
+            this.details = details;
+        }
+    }
+
+    public static class RedefineClassesResponse extends ResponseBody {
+        public String[] changedClasses = new String[0];
+        public String errorMessage = null;
+
+        /**
+         * Constructor.
+         */
+        public RedefineClassesResponse(String[] changedClasses) {
+            this(changedClasses, null);
+        }
+
+        /**
+         * Constructor.
+         */
+        public RedefineClassesResponse(String[] changedClasses, String errorMessage) {
+            this.changedClasses = changedClasses;
+            this.errorMessage = errorMessage;
+        }
+    }
+
+    public static class InlineValuesResponse extends ResponseBody {
+        public Types.Variable[] variables;
+
+        public InlineValuesResponse(Variable[] variables) {
+            this.variables = variables;
         }
     }
 }

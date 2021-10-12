@@ -17,13 +17,16 @@ import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 
 import org.apache.commons.lang3.StringUtils;
 
+import com.microsoft.java.debug.core.adapter.AdapterUtils;
 import com.sun.jdi.Method;
 import com.sun.jdi.ObjectCollectedException;
 import com.sun.jdi.ThreadReference;
@@ -56,7 +59,7 @@ public class DebugUtility {
 
     /**
      * Launch a debuggee in suspend mode.
-     * @see #launch(VirtualMachineManager, String, String, String, String, String)
+     * @see #launch(VirtualMachineManager, String, String, String, String, String, String, String[])
      */
     public static IDebugSession launch(VirtualMachineManager vmManager,
             String mainClass,
@@ -75,6 +78,31 @@ public class DebugUtility {
                 String.join(File.pathSeparator, classPaths),
                 cwd,
                 envVars);
+    }
+
+    /**
+     * Launch a debuggee in suspend mode.
+     * @see #launch(VirtualMachineManager, String, String, String, String, String, String, String[], String)
+     */
+    public static IDebugSession launch(VirtualMachineManager vmManager,
+            String mainClass,
+            String programArguments,
+            String vmArguments,
+            List<String> modulePaths,
+            List<String> classPaths,
+            String cwd,
+            String[] envVars,
+            String javaExec)
+            throws IOException, IllegalConnectorArgumentsException, VMStartException {
+        return DebugUtility.launch(vmManager,
+                mainClass,
+                programArguments,
+                vmArguments,
+                String.join(File.pathSeparator, modulePaths),
+                String.join(File.pathSeparator, classPaths),
+                cwd,
+                envVars,
+                javaExec);
     }
 
     /**
@@ -115,6 +143,50 @@ public class DebugUtility {
             String cwd,
             String[] envVars)
             throws IOException, IllegalConnectorArgumentsException, VMStartException {
+        return launch(vmManager, mainClass, programArguments, vmArguments, modulePaths, classPaths, cwd, envVars, null);
+    }
+
+    /**
+     * Launches a debuggee in suspend mode.
+     *
+     * @param vmManager
+     *            the virtual machine manager.
+     * @param mainClass
+     *            the main class.
+     * @param programArguments
+     *            the program arguments.
+     * @param vmArguments
+     *            the vm arguments.
+     * @param modulePaths
+     *            the module paths.
+     * @param classPaths
+     *            the class paths.
+     * @param cwd
+     *            the working directory of the program.
+     * @param envVars
+     *            array of strings, each element of which has environment variable settings in the format name=value.
+     *            or null if the subprocess should inherit the environment of the current process.
+     * @param javaExec
+     *            the java executable path. If not defined, then resolve from java home.
+     * @return an instance of IDebugSession.
+     * @throws IOException
+     *             when unable to launch.
+     * @throws IllegalConnectorArgumentsException
+     *             when one of the arguments is invalid.
+     * @throws VMStartException
+     *             when the debuggee was successfully launched, but terminated
+     *             with an error before a connection could be established.
+     */
+    public static IDebugSession launch(VirtualMachineManager vmManager,
+            String mainClass,
+            String programArguments,
+            String vmArguments,
+            String modulePaths,
+            String classPaths,
+            String cwd,
+            String[] envVars,
+            String javaExec)
+            throws IOException, IllegalConnectorArgumentsException, VMStartException {
         List<LaunchingConnector> connectors = vmManager.launchingConnectors();
         LaunchingConnector connector = connectors.get(0);
 
@@ -147,7 +219,7 @@ public class DebugUtility {
 
         // For java 9 project, should specify "-m $MainClass".
         String[] mainClasses = mainClass.split("/");
-        if (StringUtils.isNotBlank(modulePaths) || mainClasses.length == 2) {
+        if (mainClasses.length == 2) {
             mainClass = "-m " + mainClass;
         }
         if (StringUtils.isNotBlank(programArguments)) {
@@ -163,6 +235,15 @@ public class DebugUtility {
             arguments.get(ENV).setValue(encodeArrayArgument(envVars));
         }
 
+        if (isValidJavaExec(javaExec)) {
+            String vmExec = new File(javaExec).getName();
+            String javaHome = new File(javaExec).getParentFile().getParentFile().getAbsolutePath();
+            arguments.get(HOME).setValue(javaHome);
+            arguments.get(EXEC).setValue(vmExec);
+        } else if (StringUtils.isNotEmpty(DebugSettings.getCurrent().javaHome)) {
+            arguments.get(HOME).setValue(DebugSettings.getCurrent().javaHome);
+        }
+
         VirtualMachine vm = connector.launch(arguments);
         // workaround for JDT bug.
         // vm.version() calls org.eclipse.jdi.internal.MirrorImpl#requestVM
@@ -172,6 +253,20 @@ public class DebugUtility {
         // See https://github.com/Microsoft/java-debug/issues/23
         vm.version();
         return new DebugSession(vm);
+    }
+
+    private static boolean isValidJavaExec(String javaExec) {
+        if (StringUtils.isBlank(javaExec)) {
+            return false;
+        }
+
+        File file = new File(javaExec);
+        if (!file.exists() || !file.isFile()) {
+            return false;
+        }
+
+        return Files.isExecutable(file.toPath())
+            && Objects.equals(file.getParentFile().getName(), "bin");
     }
 
     /**
@@ -218,7 +313,21 @@ public class DebugUtility {
      * @return the new step request.
      */
     public static StepRequest createStepOverRequest(ThreadReference thread, String[] stepFilters) {
-        return createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_OVER, stepFilters);
+        return createStepOverRequest(thread, null, stepFilters);
+    }
+
+    /**
+     * Create a step over request on the specified thread.
+     * @param thread
+     *              the target thread.
+     * @param classFilters
+     *              restricts the step event to those matching the given class patterns when stepping.
+     * @param classExclusionFilters
+     *              restricts the step event to those not matching the given class patterns when stepping.
+     * @return the new step request.
+     */
+    public static StepRequest createStepOverRequest(ThreadReference thread, String[] classFilters, String[] classExclusionFilters) {
+        return createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_OVER, classFilters, classExclusionFilters);
     }
 
     /**
@@ -230,7 +339,21 @@ public class DebugUtility {
      * @return the new step request.
      */
     public static StepRequest createStepIntoRequest(ThreadReference thread, String[] stepFilters) {
-        return createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_INTO, stepFilters);
+        return createStepIntoRequest(thread, null, stepFilters);
+    }
+
+    /**
+     * Create a step into request on the specified thread.
+     * @param thread
+     *              the target thread.
+     * @param classFilters
+     *              restricts the step event to those matching the given class patterns when stepping.
+     * @param classExclusionFilters
+     *              restricts the step event to those not matching the given class patterns when stepping.
+     * @return the new step request.
+     */
+    public static StepRequest createStepIntoRequest(ThreadReference thread, String[] classFilters, String[] classExclusionFilters) {
+        return createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_INTO, classFilters, classExclusionFilters);
     }
 
     /**
@@ -242,14 +365,33 @@ public class DebugUtility {
      * @return the new step request.
      */
     public static StepRequest createStepOutRequest(ThreadReference thread, String[] stepFilters) {
-        return createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_OUT, stepFilters);
+        return createStepOutRequest(thread, null, stepFilters);
     }
 
-    private static StepRequest createStepRequest(ThreadReference thread, int stepSize, int stepDepth, String[] stepFilters) {
+    /**
+     * Create a step out request on the specified thread.
+     * @param thread
+     *              the target thread.
+     * @param classFilters
+     *              restricts the step event to those matching the given class patterns when stepping.
+     * @param classExclusionFilters
+     *              restricts the step event to those not matching the given class patterns when stepping.
+     * @return the new step request.
+     */
+    public static StepRequest createStepOutRequest(ThreadReference thread, String[] classFilters, String[] classExclusionFilters) {
+        return createStepRequest(thread, StepRequest.STEP_LINE, StepRequest.STEP_OUT, classFilters, classExclusionFilters);
+    }
+
+    private static StepRequest createStepRequest(ThreadReference thread, int stepSize, int stepDepth, String[] classFilters, String[] classExclusionFilters) {
         StepRequest request = thread.virtualMachine().eventRequestManager().createStepRequest(thread, stepSize, stepDepth);
-        if (stepFilters != null) {
-            for (String stepFilter : stepFilters) {
-                request.addClassExclusionFilter(stepFilter);
+        if (classFilters != null) {
+            for (String classFilter : classFilters) {
+                request.addClassFilter(classFilter);
+            }
+        }
+        if (classExclusionFilters != null) {
+            for (String exclusionFilter : classExclusionFilters) {
+                request.addClassExclusionFilter(exclusionFilter);
             }
         }
         request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
@@ -433,5 +575,203 @@ public class DebugUtility {
         }
 
         return result.toArray(new String[0]);
+    }
+
+    /**
+     * Parses the given command line into separate arguments that can be passed
+     * to <code>Runtime.getRuntime().exec(cmdArray)</code>.
+     *
+     * @param cmdStr command line as a single string.
+     * @return the individual arguments.
+     */
+    public static List<String> parseArguments(String cmdStr) {
+        if (cmdStr == null) {
+            return new ArrayList<>();
+        }
+
+        return AdapterUtils.isWindows() ? parseArgumentsWindows(cmdStr) : parseArgumentsNonWindows(cmdStr);
+    }
+
+    /**
+     * Parses the given command line into separate arguments for mac/linux platform.
+     * This piece of code is mainly copied from
+     * https://github.com/eclipse/eclipse.platform.debug/blob/master/org.eclipse.debug.core/core/org/eclipse/debug/core/DebugPlugin.java#L1374
+     *
+     * @param args
+     *            the command line arguments as a single string.
+     * @return the individual arguments
+     */
+    private static List<String> parseArgumentsNonWindows(String args) {
+        // man sh, see topic QUOTING
+        List<String> result = new ArrayList<>();
+
+        final int DEFAULT = 0;
+        final int ARG = 1;
+        final int IN_DOUBLE_QUOTE = 2;
+        final int IN_SINGLE_QUOTE = 3;
+
+        int state = DEFAULT;
+        StringBuilder buf = new StringBuilder();
+        int len = args.length();
+        for (int i = 0; i < len; i++) {
+            char ch = args.charAt(i);
+            if (Character.isWhitespace(ch)) {
+                if (state == DEFAULT) {
+                    // skip
+                    continue;
+                } else if (state == ARG) {
+                    state = DEFAULT;
+                    result.add(buf.toString());
+                    buf.setLength(0);
+                    continue;
+                }
+            }
+            switch (state) {
+                case DEFAULT:
+                case ARG:
+                    if (ch == '"') {
+                        state = IN_DOUBLE_QUOTE;
+                    } else if (ch == '\'') {
+                        state = IN_SINGLE_QUOTE;
+                    } else if (ch == '\\' && i + 1 < len) {
+                        state = ARG;
+                        ch = args.charAt(++i);
+                        buf.append(ch);
+                    } else {
+                        state = ARG;
+                        buf.append(ch);
+                    }
+                    break;
+
+                case IN_DOUBLE_QUOTE:
+                    if (ch == '"') {
+                        state = ARG;
+                    } else if (ch == '\\' && i + 1 < len && (args.charAt(i + 1) == '\\' || args.charAt(i + 1) == '"')) {
+                        ch = args.charAt(++i);
+                        buf.append(ch);
+                    } else {
+                        buf.append(ch);
+                    }
+                    break;
+
+                case IN_SINGLE_QUOTE:
+                    if (ch == '\'') {
+                        state = ARG;
+                    } else {
+                        buf.append(ch);
+                    }
+                    break;
+
+                default:
+                    throw new IllegalStateException();
+            }
+        }
+        if (buf.length() > 0 || state != DEFAULT) {
+            result.add(buf.toString());
+        }
+
+        return result;
+    }
+
+    /**
+     * Parses the given command line into separate arguments for windows platform.
+     * This piece of code is mainly copied from
+     * https://github.com/eclipse/eclipse.platform.debug/blob/master/org.eclipse.debug.core/core/org/eclipse/debug/core/DebugPlugin.java#L1264
+     *
+     * @param args
+     *            the command line arguments as a single string.
+     * @return the individual arguments
+     */
+    private static List<String> parseArgumentsWindows(String args) {
+        // see http://msdn.microsoft.com/en-us/library/a1y7w461.aspx
+        List<String> result = new ArrayList<>();
+        final int DEFAULT = 0;
+        final int ARG = 1;
+        final int IN_DOUBLE_QUOTE = 2;
+
+        int state = DEFAULT;
+        int backslashes = 0;
+        StringBuilder buf = new StringBuilder();
+        int len = args.length();
+        for (int i = 0; i < len; i++) {
+            char ch = args.charAt(i);
+            if (ch == '\\') {
+                backslashes++;
+                continue;
+            } else if (backslashes != 0) {
+                if (ch == '"') {
+                    for (; backslashes >= 2; backslashes -= 2) {
+                        buf.append('\\');
+                    }
+                    if (backslashes == 1) {
+                        if (state == DEFAULT) {
+                            state = ARG;
+                        }
+                        buf.append('"');
+                        backslashes = 0;
+                        continue;
+                    } // else fall through to switch
+                } else {
+                    // false alarm, treat passed backslashes literally...
+                    if (state == DEFAULT) {
+                        state = ARG;
+                    }
+                    for (; backslashes > 0; backslashes--) {
+                        buf.append('\\');
+                    }
+                    // fall through to switch
+                }
+            }
+            if (Character.isWhitespace(ch)) {
+                if (state == DEFAULT) {
+                    // skip
+                    continue;
+                } else if (state == ARG) {
+                    state = DEFAULT;
+                    result.add(buf.toString());
+                    buf.setLength(0);
+                    continue;
+                }
+            }
+            switch (state) {
+                case DEFAULT:
+                case ARG:
+                    if (ch == '"') {
+                        state = IN_DOUBLE_QUOTE;
+                    } else {
+                        state = ARG;
+                        buf.append(ch);
+                    }
+                    break;
+
+                case IN_DOUBLE_QUOTE:
+                    if (ch == '"') {
+                        if (i + 1 < len && args.charAt(i + 1) == '"') {
+                            /* Undocumented feature in Windows:
+                             * Two consecutive double quotes inside a double-quoted argument are interpreted as
+                             * a single double quote.
+                             */
+                            buf.append('"');
+                            i++;
+                        } else if (buf.length() == 0) {
+                            // empty string on Windows platform. Account for bug in constructor of JDK's java.lang.ProcessImpl.
+                            result.add("\"\""); //$NON-NLS-1$
+                            state = DEFAULT;
+                        } else {
+                            state = ARG;
+                        }
+                    } else {
+                        buf.append(ch);
+                    }
+                    break;
+
+                default:
+                    throw new IllegalStateException();
+            }
+        }
+        if (buf.length() > 0 || state != DEFAULT) {
+            result.add(buf.toString());
+        }
+        return result;
     }
 }

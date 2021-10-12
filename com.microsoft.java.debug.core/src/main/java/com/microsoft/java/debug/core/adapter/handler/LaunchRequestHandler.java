@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright (c) 2018 Microsoft Corporation and others.
+* Copyright (c) 2018-2021 Microsoft Corporation and others.
 * All rights reserved. This program and the accompanying materials
 * are made available under the terms of the Eclipse Public License v1.0
 * which accompanies this distribution, and is available at
@@ -12,8 +12,13 @@
 package com.microsoft.java.debug.core.adapter.handler;
 
 import java.io.File;
+import java.io.IOException;
+import java.net.MalformedURLException;
+import java.net.URISyntaxException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -21,6 +26,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -29,21 +38,35 @@ import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.StringUtils;
 
 import com.microsoft.java.debug.core.Configuration;
+import com.microsoft.java.debug.core.DebugException;
+import com.microsoft.java.debug.core.DebugSettings;
+import com.microsoft.java.debug.core.DebugUtility;
+import com.microsoft.java.debug.core.IDebugSession;
 import com.microsoft.java.debug.core.adapter.AdapterUtils;
 import com.microsoft.java.debug.core.adapter.ErrorCode;
 import com.microsoft.java.debug.core.adapter.IDebugAdapterContext;
 import com.microsoft.java.debug.core.adapter.IDebugRequestHandler;
 import com.microsoft.java.debug.core.adapter.LaunchMode;
+import com.microsoft.java.debug.core.adapter.ProcessConsole;
+import com.microsoft.java.debug.core.protocol.Events;
+import com.microsoft.java.debug.core.protocol.Events.OutputEvent;
+import com.microsoft.java.debug.core.protocol.Events.OutputEvent.Category;
 import com.microsoft.java.debug.core.protocol.Messages.Response;
 import com.microsoft.java.debug.core.protocol.Requests.Arguments;
 import com.microsoft.java.debug.core.protocol.Requests.CONSOLE;
 import com.microsoft.java.debug.core.protocol.Requests.Command;
 import com.microsoft.java.debug.core.protocol.Requests.LaunchArguments;
+import com.microsoft.java.debug.core.protocol.Requests.ShortenApproach;
+import com.microsoft.java.debug.core.protocol.Types;
+import com.sun.jdi.connect.IllegalConnectorArgumentsException;
+import com.sun.jdi.connect.VMStartException;
+import com.sun.jdi.event.VMDisconnectEvent;
 
 public class LaunchRequestHandler implements IDebugRequestHandler {
     protected static final Logger logger = Logger.getLogger(Configuration.LOGGER_NAME);
     protected static final long RUNINTERMINAL_TIMEOUT = 10 * 1000;
     protected ILaunchDelegate activeLaunchHandler;
+    private CompletableFuture<Boolean> waitForDebuggeeConsole = new CompletableFuture<>();
 
     @Override
     public List<Command> getTargetCommands() {
@@ -53,7 +76,8 @@ public class LaunchRequestHandler implements IDebugRequestHandler {
     @Override
     public CompletableFuture<Response> handle(Command command, Arguments arguments, Response response, IDebugAdapterContext context) {
         LaunchArguments launchArguments = (LaunchArguments) arguments;
-        activeLaunchHandler = launchArguments.noDebug ? new LaunchWithoutDebuggingDelegate() : new LaunchWithDebuggingDelegate();
+        activeLaunchHandler = launchArguments.noDebug ? new LaunchWithoutDebuggingDelegate((daContext) -> handleTerminatedEvent(daContext))
+                : new LaunchWithDebuggingDelegate();
         return handleLaunchCommand(arguments, response, context);
     }
 
@@ -87,24 +111,98 @@ public class LaunchRequestHandler implements IDebugRequestHandler {
 
         activeLaunchHandler.preLaunch(launchArguments, context);
 
+        // Use the specified cli style to launch the program.
+        if (launchArguments.shortenCommandLine == ShortenApproach.JARMANIFEST) {
+            if (ArrayUtils.isNotEmpty(launchArguments.classPaths)) {
+                try {
+                    Path tempfile = LaunchUtils.generateClasspathJar(launchArguments.classPaths);
+                    launchArguments.vmArgs += " -cp \"" + tempfile.toAbsolutePath().toString() + "\"";
+                    launchArguments.classPaths = new String[0];
+                    context.setClasspathJar(tempfile);
+                } catch (IllegalArgumentException | MalformedURLException ex) {
+                    logger.log(Level.SEVERE, String.format("Failed to launch the program with jarmanifest style: %s", ex.toString(), ex));
+                    throw AdapterUtils.createCompletionException("Failed to launch the program with jarmanifest style: " + ex.toString(),
+                            ErrorCode.LAUNCH_FAILURE, ex);
+                } catch (IOException e) {
+                    logger.log(Level.SEVERE, String.format("Failed to create a temp classpath.jar: %s", e.toString()), e);
+                }
+            }
+        } else if (launchArguments.shortenCommandLine == ShortenApproach.ARGFILE) {
+            try {
+                Path tempfile = LaunchUtils.generateArgfile(launchArguments.classPaths, launchArguments.modulePaths);
+                launchArguments.vmArgs += " \"@" + tempfile.toAbsolutePath().toString() + "\"";
+                launchArguments.classPaths = new String[0];
+                launchArguments.modulePaths = new String[0];
+                context.setArgsfile(tempfile);
+            } catch (IOException e) {
+                logger.log(Level.SEVERE, String.format("Failed to create a temp argfile: %s", e.toString()), e);
+            }
+        }
+
         return launch(launchArguments, response, context).thenCompose(res -> {
+            LaunchUtils.releaseTempLaunchFile(context.getClasspathJar());
+            LaunchUtils.releaseTempLaunchFile(context.getArgsfile());
             if (res.success) {
                 activeLaunchHandler.postLaunch(launchArguments, context);
+            }
+
+            IDebugSession debugSession = context.getDebugSession();
+            if (debugSession != null) {
+                debugSession.getEventHub().events()
+                    .filter((debugEvent) -> debugEvent.event instanceof VMDisconnectEvent)
+                    .subscribe((debugEvent) -> {
+                        context.setVmTerminated();
+                        // Terminate eventHub thread.
+                        try {
+                            debugSession.getEventHub().close();
+                        } catch (Exception e) {
+                            // do nothing.
+                        }
+
+                        handleTerminatedEvent(context);
+                    });
             }
             return CompletableFuture.completedFuture(res);
         });
     }
 
-    protected static String[] constructLaunchCommands(LaunchArguments launchArguments, boolean serverMode, String address) {
-        String slash = System.getProperty("file.separator");
+    protected void handleTerminatedEvent(IDebugAdapterContext context) {
+        CompletableFuture.runAsync(() -> {
+            try {
+                waitForDebuggeeConsole.get(5, TimeUnit.SECONDS);
+            } catch (InterruptedException | ExecutionException | TimeoutException e) {
+                // do nothing.
+            }
 
+            context.getProtocolServer().sendEvent(new Events.TerminatedEvent());
+        });
+    }
+
+    /**
+     * Construct the Java command lines based on the given launch arguments.
+     * @param launchArguments - The launch arguments
+     * @param serverMode - whether to enable the debug port with server mode
+     * @param address - the debug port
+     * @return the command arrays
+     */
+    public static String[] constructLaunchCommands(LaunchArguments launchArguments, boolean serverMode, String address) {
         List<String> launchCmds = new ArrayList<>();
-        launchCmds.add(System.getProperty("java.home") + slash + "bin" + slash + "java");
+        if (launchArguments.launcherScript != null) {
+            launchCmds.add(launchArguments.launcherScript);
+        }
+
+        if (StringUtils.isNotBlank(launchArguments.javaExec)) {
+            launchCmds.add(launchArguments.javaExec);
+        } else {
+            final String javaHome = StringUtils.isNotEmpty(DebugSettings.getCurrent().javaHome) ? DebugSettings.getCurrent().javaHome
+                    : System.getProperty("java.home");
+            launchCmds.add(Paths.get(javaHome, "bin", "java").toString());
+        }
         if (StringUtils.isNotEmpty(address)) {
             launchCmds.add(String.format("-agentlib:jdwp=transport=dt_socket,server=%s,suspend=y,address=%s", serverMode ? "y" : "n", address));
         }
         if (StringUtils.isNotBlank(launchArguments.vmArgs)) {
-            launchCmds.addAll(parseArguments(launchArguments.vmArgs));
+            launchCmds.addAll(DebugUtility.parseArguments(launchArguments.vmArgs));
         }
         if (ArrayUtils.isNotEmpty(launchArguments.modulePaths)) {
             launchCmds.add("--module-path");
@@ -116,12 +214,12 @@ public class LaunchRequestHandler implements IDebugRequestHandler {
         }
         // For java 9 project, should specify "-m $MainClass".
         String[] mainClasses = launchArguments.mainClass.split("/");
-        if (ArrayUtils.isNotEmpty(launchArguments.modulePaths) || mainClasses.length == 2) {
+        if (mainClasses.length == 2) {
             launchCmds.add("-m");
         }
         launchCmds.add(launchArguments.mainClass);
         if (StringUtils.isNotBlank(launchArguments.args)) {
-            launchCmds.addAll(parseArguments(launchArguments.args));
+            launchCmds.addAll(DebugUtility.parseArguments(launchArguments.args));
         }
         return launchCmds.toArray(new String[0]);
     }
@@ -135,10 +233,58 @@ public class LaunchRequestHandler implements IDebugRequestHandler {
 
         if (context.supportsRunInTerminalRequest()
                 && (launchArguments.console == CONSOLE.integratedTerminal || launchArguments.console == CONSOLE.externalTerminal)) {
+            waitForDebuggeeConsole.complete(true);
             return activeLaunchHandler.launchInTerminal(launchArguments, response, context);
-        } else {
-            return activeLaunchHandler.launchInternally(launchArguments, response, context);
         }
+
+        CompletableFuture<Response> resultFuture = new CompletableFuture<>();
+        try {
+            Process debuggeeProcess = activeLaunchHandler.launch(launchArguments, context);
+            context.setDebuggeeProcess(debuggeeProcess);
+            ProcessConsole debuggeeConsole = new ProcessConsole(debuggeeProcess, "Debuggee", context.getDebuggeeEncoding());
+            debuggeeConsole.lineMessages()
+                .map((message) -> convertToOutputEvent(message.output, message.category, context))
+                .doFinally(() -> waitForDebuggeeConsole.complete(true))
+                .subscribe((event) -> context.getProtocolServer().sendEvent(event));
+            debuggeeConsole.start();
+            resultFuture.complete(response);
+        } catch (IOException | IllegalConnectorArgumentsException | VMStartException e) {
+            resultFuture.completeExceptionally(
+                    new DebugException(
+                            String.format("Failed to launch debuggee VM. Reason: %s", e.toString()),
+                            ErrorCode.LAUNCH_FAILURE.getId()
+                    )
+            );
+        }
+
+        return resultFuture;
+    }
+
+    private static final Pattern STACKTRACE_PATTERN = Pattern.compile("\\s+at\\s+([\\w$\\.]+\\/)?(([\\w$]+\\.)+[<\\w$>]+)\\(([\\w-$]+\\.java:\\d+)\\)");
+
+    private static OutputEvent convertToOutputEvent(String message, Category category, IDebugAdapterContext context) {
+        Matcher matcher = STACKTRACE_PATTERN.matcher(message);
+        if (matcher.find()) {
+            String methodField = matcher.group(2);
+            String locationField = matcher.group(matcher.groupCount());
+            String fullyQualifiedName = methodField.substring(0, methodField.lastIndexOf("."));
+            String packageName = fullyQualifiedName.lastIndexOf(".") > -1 ? fullyQualifiedName.substring(0, fullyQualifiedName.lastIndexOf(".")) : "";
+            String[] locations = locationField.split(":");
+            String sourceName = locations[0];
+            int lineNumber = Integer.parseInt(locations[1]);
+            String sourcePath = StringUtils.isBlank(packageName) ? sourceName
+                    : packageName.replace('.', File.separatorChar) + File.separatorChar + sourceName;
+            Types.Source source = null;
+            try {
+                source = StackTraceRequestHandler.convertDebuggerSourceToClient(fullyQualifiedName, sourceName, sourcePath, context);
+            } catch (URISyntaxException e) {
+                // do nothing.
+            }
+
+            return new OutputEvent(category, message, source, lineNumber);
+        }
+
+        return new OutputEvent(category, message);
     }
 
     protected static String[] constructEnvironmentVariables(LaunchArguments launchArguments) {
@@ -165,26 +311,6 @@ public class LaunchRequestHandler implements IDebugRequestHandler {
             }
         }
         return envVars;
-    }
-
-    /**
-     * Parses the given command line into separate arguments that can be passed
-     * to <code>Runtime.getRuntime().exec(cmdArray)</code>.
-     *
-     * @param cmdStr command line as a single string.
-     * @return the arguments array.
-     */
-    protected static List<String> parseArguments(String cmdStr) {
-        List<String> list = new ArrayList<String>();
-        // The legal arguments are
-        // 1. token starting with something other than quote " and followed by zero or more non-space characters
-        // 2. a quote " followed by whatever, until another quote "
-        Matcher m = Pattern.compile("([^\"]\\S*|\".+?\")\\s*").matcher(cmdStr);
-        while (m.find()) {
-            String arg = m.group(1).replaceAll("^\"|\"$", ""); // Remove surrounding quotes.
-            list.add(arg);
-        }
-        return list;
     }
 
     public static String parseMainClassWithoutModuleName(String mainClass) {

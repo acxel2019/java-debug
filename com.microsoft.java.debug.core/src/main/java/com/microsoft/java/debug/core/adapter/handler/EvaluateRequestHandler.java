@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright (c) 2017 Microsoft Corporation and others.
+* Copyright (c) 2017-2021 Microsoft Corporation and others.
 * All rights reserved. This program and the accompanying materials
 * are made available under the terms of the Eclipse Public License v1.0
 * which accompanies this distribution, and is available at
@@ -17,9 +17,12 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import org.apache.commons.lang3.StringUtils;
 
+import com.microsoft.java.debug.core.Configuration;
 import com.microsoft.java.debug.core.DebugException;
 import com.microsoft.java.debug.core.DebugSettings;
 import com.microsoft.java.debug.core.adapter.AdapterUtils;
@@ -28,7 +31,10 @@ import com.microsoft.java.debug.core.adapter.IDebugAdapterContext;
 import com.microsoft.java.debug.core.adapter.IDebugRequestHandler;
 import com.microsoft.java.debug.core.adapter.IEvaluationProvider;
 import com.microsoft.java.debug.core.adapter.variables.IVariableFormatter;
+import com.microsoft.java.debug.core.adapter.variables.JavaLogicalStructure;
+import com.microsoft.java.debug.core.adapter.variables.JavaLogicalStructureManager;
 import com.microsoft.java.debug.core.adapter.variables.StackFrameReference;
+import com.microsoft.java.debug.core.adapter.variables.VariableDetailUtils;
 import com.microsoft.java.debug.core.adapter.variables.VariableProxy;
 import com.microsoft.java.debug.core.adapter.variables.VariableUtils;
 import com.microsoft.java.debug.core.protocol.Messages.Response;
@@ -37,11 +43,14 @@ import com.microsoft.java.debug.core.protocol.Requests.Command;
 import com.microsoft.java.debug.core.protocol.Requests.EvaluateArguments;
 import com.microsoft.java.debug.core.protocol.Responses;
 import com.sun.jdi.ArrayReference;
+import com.sun.jdi.IntegerValue;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.Value;
 import com.sun.jdi.VoidValue;
 
 public class EvaluateRequestHandler implements IDebugRequestHandler {
+    protected static final Logger logger = Logger.getLogger(Configuration.LOGGER_NAME);
+
     @Override
     public List<Command> getTargetCommands() {
         return Arrays.asList(Command.EVALUATE);
@@ -69,8 +78,8 @@ public class EvaluateRequestHandler implements IDebugRequestHandler {
         }
 
         return CompletableFuture.supplyAsync(() -> {
+            IEvaluationProvider engine = context.getProvider(IEvaluationProvider.class);
             try {
-                IEvaluationProvider engine = context.getProvider(IEvaluationProvider.class);
                 Value value = engine.evaluate(expression, stackFrameReference.getThread(), stackFrameReference.getDepth()).get();
                 IVariableFormatter variableFormatter = context.getVariableFormatter();
                 if (value instanceof VoidValue) {
@@ -79,13 +88,73 @@ public class EvaluateRequestHandler implements IDebugRequestHandler {
                 }
                 long threadId = stackFrameReference.getThread().uniqueID();
                 if (value instanceof ObjectReference) {
-                    VariableProxy varProxy = new VariableProxy(stackFrameReference.getThread(), "eval", value);
-                    int referenceId = VariableUtils.hasChildren(value, showStaticVariables)
-                            ? context.getRecyclableIdPool().addObject(threadId, varProxy) : 0;
-                    int indexedVariableId = value instanceof ArrayReference ? ((ArrayReference) value).length() : 0;
-                    response.body = new Responses.EvaluateResponseBody(variableFormatter.valueToString(value, options),
-                            referenceId, variableFormatter.typeToString(value == null ? null : value.type(), options),
-                            indexedVariableId);
+                    VariableProxy varProxy = new VariableProxy(stackFrameReference.getThread(), "eval", value, null, expression);
+                    int indexedVariables = -1;
+                    Value sizeValue = null;
+                    if (value instanceof ArrayReference) {
+                        indexedVariables = ((ArrayReference) value).length();
+                    } else if (value instanceof ObjectReference && DebugSettings.getCurrent().showLogicalStructure && engine != null) {
+                        try {
+                            JavaLogicalStructure structure = JavaLogicalStructureManager.getLogicalStructure((ObjectReference) value);
+                            if (structure != null && structure.getSizeExpression() != null) {
+                                sizeValue = structure.getSize((ObjectReference) value, stackFrameReference.getThread(), engine);
+                                if (sizeValue != null && sizeValue instanceof IntegerValue) {
+                                    indexedVariables = ((IntegerValue) sizeValue).value();
+                                }
+                            }
+                        } catch (Exception e) {
+                            logger.log(Level.INFO, "Failed to get the logical size of the variable", e);
+                        }
+                    }
+                    int referenceId = 0;
+                    if (indexedVariables > 0 || (indexedVariables < 0 && value instanceof ObjectReference)) {
+                        referenceId = context.getRecyclableIdPool().addObject(threadId, varProxy);
+                    }
+
+                    boolean hasErrors = false;
+                    String valueString = null;
+                    try {
+                        valueString = variableFormatter.valueToString(value, options);
+                    } catch (OutOfMemoryError e) {
+                        hasErrors = true;
+                        logger.log(Level.SEVERE, "Failed to convert the value of a large object to a string", e);
+                        valueString = "<Unable to display the value of a large object>";
+                    }  catch (Exception e) {
+                        hasErrors = true;
+                        logger.log(Level.SEVERE, "Failed to resolve the variable value", e);
+                        valueString = "<Failed to resolve the variable value due to \"" + e.getMessage() + "\">";
+                    }
+
+                    String detailsString = null;
+                    if (hasErrors) {
+                        // If failed to resolve the variable value, skip the details info as well.
+                    } else if (sizeValue != null) {
+                        detailsString = "size=" + variableFormatter.valueToString(sizeValue, options);
+                    } else if (DebugSettings.getCurrent().showToString) {
+                        try {
+                            detailsString = VariableDetailUtils.formatDetailsValue(value, stackFrameReference.getThread(), variableFormatter, options, engine);
+                        } catch (OutOfMemoryError e) {
+                            logger.log(Level.SEVERE, "Failed to compute the toString() value of a large object", e);
+                            detailsString = "<Unable to display the details of a large object>";
+                        } catch (Exception e) {
+                            logger.log(Level.SEVERE, "Failed to compute the toString() value", e);
+                            detailsString = "<Failed to resolve the variable details due to \"" + e.getMessage() + "\">";
+                        }
+                    }
+
+                    if ("clipboard".equals(evalArguments.context) && detailsString != null) {
+                        response.body = new Responses.EvaluateResponseBody(detailsString, -1, "String", 0);
+                    } else {
+                        String typeString = "";
+                        try {
+                            typeString = variableFormatter.typeToString(value == null ? null : value.type(), options);
+                        } catch (Exception e) {
+                            logger.log(Level.SEVERE, "Failed to resolve the variable type", e);
+                            typeString = "";
+                        }
+                        response.body = new Responses.EvaluateResponseBody((detailsString == null) ? valueString : valueString + " " + detailsString,
+                                referenceId, typeString, Math.max(indexedVariables, 0));
+                    }
                     return response;
                 }
                 // for primitive value

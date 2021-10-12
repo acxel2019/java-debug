@@ -15,8 +15,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 
+import org.apache.commons.lang3.StringUtils;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.resources.IResource;
 import org.eclipse.core.resources.IWorkspaceRoot;
@@ -25,6 +27,9 @@ import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.IPath;
 import org.eclipse.debug.core.sourcelookup.ISourceContainer;
 import org.eclipse.jdt.core.IClassFile;
+import org.eclipse.jdt.core.IClasspathAttribute;
+import org.eclipse.jdt.core.IClasspathEntry;
+import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IModuleDescription;
 import org.eclipse.jdt.core.IPackageFragmentRoot;
@@ -47,6 +52,9 @@ import com.sun.jdi.StackFrame;
 import com.sun.jdi.Type;
 
 public class JdtUtils {
+    private static final String TEST_SCOPE = "test";
+    private static final String MAVEN_SCOPE_ATTRIBUTE = "maven.scope";
+    private static final String GRADLE_SCOPE_ATTRIBUTE = "gradle_scope";
 
     /**
      * Returns the module this project represents or null if the Java project doesn't represent any named module.
@@ -97,7 +105,7 @@ public class JdtUtils {
      * If the project doesn't exist or not a java project, return null.
      */
     public static IJavaProject getJavaProject(String projectName) {
-        if (projectName == null) {
+        if (StringUtils.isBlank(projectName)) {
             return null;
         }
         IWorkspaceRoot root = ResourcesPlugin.getWorkspace().getRoot();
@@ -106,15 +114,71 @@ public class JdtUtils {
     }
 
     /**
+     * List all available Java projects of the specified workspace.
+     */
+    public static List<IJavaProject> listJavaProjects(IWorkspaceRoot workspace) {
+        List<IJavaProject> results = new ArrayList<>();
+        for (IProject project : workspace.getProjects()) {
+            if (isJavaProject(project)) {
+                results.add(JavaCore.create(project));
+            }
+        }
+        return results;
+    }
+
+    /**
      * Given the project name, return the corresponding project object.
      * If the project doesn't exist, return null.
      */
     public static IProject getProject(String projectName) {
-        if (projectName == null) {
+        if (StringUtils.isBlank(projectName)) {
             return null;
         }
         IWorkspaceRoot root = ResourcesPlugin.getWorkspace().getRoot();
         return root.getProject(projectName);
+    }
+
+    /**
+     * Compute the fragment roots for each test source folders.
+     *
+     * @param project the java project.
+     * @return the fragment roots for each test source folders.
+     */
+    public static IPackageFragmentRoot[] getTestPackageFragmentRoots(IJavaProject project) {
+        try {
+            IPackageFragmentRoot[] packageFragmentRoot = project.getPackageFragmentRoots();
+            List<IPackageFragmentRoot> sources = new ArrayList<>();
+            for (int i = 0; i < packageFragmentRoot.length; i++) {
+                if (packageFragmentRoot[i].getElementType() == IJavaElement.PACKAGE_FRAGMENT_ROOT
+                        && packageFragmentRoot[i].getKind() == IPackageFragmentRoot.K_SOURCE) {
+                    IClasspathEntry cpe = packageFragmentRoot[i].getResolvedClasspathEntry();
+
+                    if (isTest(cpe)) {
+                        sources.add(packageFragmentRoot[i]);
+                    }
+                }
+            }
+            return sources.toArray(new IPackageFragmentRoot[0]);
+        } catch (JavaModelException e) {
+            // ignore
+            return new IPackageFragmentRoot[0];
+        }
+    }
+
+    /**
+     * There is an issue on IClasspathEntry#isTest: it will return true if the scope is runtime, so we will this method for testing whether
+     * the classpath entry is for test only.
+     *
+     * @param classpathEntry classpath entry
+     * @return whether this classpath entry is only used in test
+     */
+    public static boolean isTest(final IClasspathEntry classpathEntry) {
+        for (IClasspathAttribute attribute : classpathEntry.getExtraAttributes()) {
+            if (GRADLE_SCOPE_ATTRIBUTE.equals(attribute.getName()) || MAVEN_SCOPE_ATTRIBUTE.equals(attribute.getName())) {
+                return TEST_SCOPE.equals(attribute.getValue());
+            }
+        }
+        return classpathEntry.isTest();
     }
 
     /**
@@ -335,5 +399,20 @@ public class JdtUtils {
             name.append("[]"); //$NON-NLS-1$
         }
         return name.toString();
+    }
+
+    /**
+     * Check whether two resources point to the same physical file.
+     */
+    public static boolean isSameFile(IResource resource1, IResource resource2) {
+        if (resource1 == null || resource2 == null) {
+            return false;
+        }
+
+        if (Objects.equals(resource1, resource2)) {
+            return true;
+        }
+
+        return Objects.equals(resource1.getLocation(), resource2.getLocation());
     }
 }

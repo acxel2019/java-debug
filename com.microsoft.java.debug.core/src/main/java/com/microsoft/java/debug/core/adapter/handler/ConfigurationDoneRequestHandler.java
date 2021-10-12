@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright (c) 2017 Microsoft Corporation and others.
+* Copyright (c) 2017-2020 Microsoft Corporation and others.
 * All rights reserved. This program and the accompanying materials
 * are made available under the terms of the Eclipse Public License v1.0
 * which accompanies this distribution, and is available at
@@ -14,16 +14,20 @@ package com.microsoft.java.debug.core.adapter.handler;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.logging.Logger;
 
+import com.microsoft.java.debug.core.Configuration;
 import com.microsoft.java.debug.core.DebugEvent;
 import com.microsoft.java.debug.core.DebugUtility;
 import com.microsoft.java.debug.core.IDebugSession;
+import com.microsoft.java.debug.core.JdiExceptionReference;
 import com.microsoft.java.debug.core.UsageDataSession;
 import com.microsoft.java.debug.core.adapter.AdapterUtils;
 import com.microsoft.java.debug.core.adapter.ErrorCode;
 import com.microsoft.java.debug.core.adapter.IDebugAdapterContext;
 import com.microsoft.java.debug.core.adapter.IDebugRequestHandler;
 import com.microsoft.java.debug.core.adapter.IEvaluationProvider;
+import com.microsoft.java.debug.core.adapter.IVirtualMachineManagerProvider;
 import com.microsoft.java.debug.core.protocol.Events;
 import com.microsoft.java.debug.core.protocol.Messages.Response;
 import com.microsoft.java.debug.core.protocol.Requests.Arguments;
@@ -39,6 +43,8 @@ import com.sun.jdi.event.VMDisconnectEvent;
 import com.sun.jdi.event.VMStartEvent;
 
 public class ConfigurationDoneRequestHandler implements IDebugRequestHandler {
+    protected static final Logger logger = Logger.getLogger(Configuration.LOGGER_NAME);
+    private VMHandler vmHandler = new VMHandler();
 
     @Override
     public List<Command> getTargetCommands() {
@@ -48,6 +54,7 @@ public class ConfigurationDoneRequestHandler implements IDebugRequestHandler {
     @Override
     public CompletableFuture<Response> handle(Command command, Arguments arguments, Response response, IDebugAdapterContext context) {
         IDebugSession debugSession = context.getDebugSession();
+        vmHandler.setVmProvider(context.getProvider(IVirtualMachineManagerProvider.class));
         if (debugSession != null) {
             // This is a global event handler to handle the JDI Event from Virtual Machine.
             debugSession.getEventHub().events().subscribe(debugEvent -> {
@@ -72,16 +79,22 @@ public class ConfigurationDoneRequestHandler implements IDebugRequestHandler {
                 });
             }
         } else if (event instanceof VMDeathEvent) {
+            vmHandler.disconnectVirtualMachine(event.virtualMachine());
             context.setVmTerminated();
             context.getProtocolServer().sendEvent(new Events.ExitedEvent(0));
         } else if (event instanceof VMDisconnectEvent) {
-            context.setVmTerminated();
-            context.getProtocolServer().sendEvent(new Events.TerminatedEvent());
-            // Terminate eventHub thread.
-            try {
-                debugSession.getEventHub().close();
-            } catch (Exception e) {
-                // do nothing.
+            vmHandler.disconnectVirtualMachine(event.virtualMachine());
+            if (context.isAttached()) {
+                context.setVmTerminated();
+                context.getProtocolServer().sendEvent(new Events.TerminatedEvent());
+                // Terminate eventHub thread.
+                try {
+                    debugSession.getEventHub().close();
+                } catch (Exception e) {
+                    // do nothing.
+                }
+            } else {
+                // Skip it when the debugger is in launch mode, because LaunchRequestHandler will handle the event there.
             }
         } else if (event instanceof ThreadStartEvent) {
             ThreadReference startThread = ((ThreadStartEvent) event).thread();
@@ -100,6 +113,10 @@ public class ConfigurationDoneRequestHandler implements IDebugRequestHandler {
             if (engine.isInEvaluation(bpThread)) {
                 return;
             }
+
+            JdiExceptionReference jdiException = new JdiExceptionReference(((ExceptionEvent) event).exception(),
+                    ((ExceptionEvent) event).catchLocation() == null);
+            context.getExceptionManager().setException(thread.uniqueID(), jdiException);
             context.getProtocolServer().sendEvent(new Events.StoppedEvent("exception", thread.uniqueID()));
             debugEvent.shouldResume = false;
         } else {

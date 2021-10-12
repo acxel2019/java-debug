@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright (c) 2017 Microsoft Corporation and others.
+* Copyright (c) 2017-2021 Microsoft Corporation and others.
 * All rights reserved. This program and the accompanying materials
 * are made available under the terms of the Eclipse Public License v1.0
 * which accompanies this distribution, and is available at
@@ -11,7 +11,9 @@
 
 package com.microsoft.java.debug.core.adapter;
 
+import java.io.File;
 import java.io.UnsupportedEncodingException;
+import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URLDecoder;
@@ -38,6 +40,8 @@ import com.microsoft.java.debug.core.protocol.Types;
 public class AdapterUtils {
     private static final String OS_NAME = System.getProperty("os.name", "").toLowerCase();
     private static final Pattern ENCLOSING_CLASS_REGEX = Pattern.compile("^([^\\$]*)");
+    public static final boolean isWin = isWindows();
+    public static final boolean isMac = OS_NAME.contains("mac") || OS_NAME.contains("darwin");
 
     /**
      * Check if the OS is windows or not.
@@ -55,10 +59,12 @@ public class AdapterUtils {
      * @return the absolute file path
      */
     public static String sourceLookup(String[] sourcePaths, String sourceName) {
-        for (String path : sourcePaths) {
-            Path fullpath = Paths.get(path, sourceName);
-            if (Files.isRegularFile(fullpath)) {
-                return fullpath.toString();
+        if (sourcePaths != null) {
+            for (String path : sourcePaths) {
+                Path fullpath = Paths.get(path, sourceName);
+                if (Files.isRegularFile(fullpath)) {
+                    return fullpath.toString();
+                }
             }
         }
         return null;
@@ -160,6 +166,19 @@ public class AdapterUtils {
     }
 
     /**
+     * Convert a file path to an url string.
+     * @param path
+     *              the file path
+     * @return the url string
+     * @throws MalformedURLException
+     *              if the file path cannot be constructed to an url because of some errors.
+     */
+    public static String toUrl(String path) throws MalformedURLException {
+        File file = new File(path);
+        return file.toURI().toURL().toString();
+    }
+
+    /**
      * Check a string variable is an uri or not.
      */
     public static boolean isUri(String uriString) {
@@ -234,7 +253,6 @@ public class AdapterUtils {
     public static DebugException createUserErrorDebugException(String message, ErrorCode errorCode) {
         return new DebugException(message, errorCode.getId(), true);
     }
-
 
     /**
      * Calculate SHA-256 Digest of given string.

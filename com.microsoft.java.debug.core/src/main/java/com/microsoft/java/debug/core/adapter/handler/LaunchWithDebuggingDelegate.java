@@ -20,6 +20,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.logging.Logger;
 
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.SystemUtils;
+
 import com.google.gson.JsonObject;
 import com.microsoft.java.debug.core.Configuration;
 import com.microsoft.java.debug.core.DebugException;
@@ -34,7 +37,6 @@ import com.microsoft.java.debug.core.adapter.IEvaluationProvider;
 import com.microsoft.java.debug.core.adapter.IHotCodeReplaceProvider;
 import com.microsoft.java.debug.core.adapter.ISourceLookUpProvider;
 import com.microsoft.java.debug.core.adapter.IVirtualMachineManagerProvider;
-import com.microsoft.java.debug.core.adapter.ProcessConsole;
 import com.microsoft.java.debug.core.protocol.Events;
 import com.microsoft.java.debug.core.protocol.JsonUtils;
 import com.microsoft.java.debug.core.protocol.Messages.Request;
@@ -47,27 +49,30 @@ import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.connect.Connector;
 import com.sun.jdi.connect.IllegalConnectorArgumentsException;
 import com.sun.jdi.connect.ListeningConnector;
+import com.sun.jdi.connect.TransportTimeoutException;
 import com.sun.jdi.connect.VMStartException;
 
 public class LaunchWithDebuggingDelegate implements ILaunchDelegate {
 
     protected static final Logger logger = Logger.getLogger(Configuration.LOGGER_NAME);
-    private static final int ACCEPT_TIMEOUT = 10 * 1000;
+    private static final int ATTACH_TERMINAL_TIMEOUT = 20 * 1000;
     private static final String TERMINAL_TITLE = "Java Debug Console";
     protected static final long RUNINTERMINAL_TIMEOUT = 10 * 1000;
+    private VMHandler vmHandler = new VMHandler();
 
     @Override
     public CompletableFuture<Response> launchInTerminal(LaunchArguments launchArguments, Response response, IDebugAdapterContext context) {
         CompletableFuture<Response> resultFuture = new CompletableFuture<>();
 
         IVirtualMachineManagerProvider vmProvider = context.getProvider(IVirtualMachineManagerProvider.class);
+        vmHandler.setVmProvider(vmProvider);
         final String launchInTerminalErrorFormat = "Failed to launch debuggee in terminal. Reason: %s";
 
         try {
             List<ListeningConnector> connectors = vmProvider.getVirtualMachineManager().listeningConnectors();
             ListeningConnector listenConnector = connectors.get(0);
             Map<String, Connector.Argument> args = listenConnector.defaultArguments();
-            ((Connector.IntegerArgument) args.get("timeout")).setValue(ACCEPT_TIMEOUT);
+            ((Connector.IntegerArgument) args.get("timeout")).setValue(ATTACH_TERMINAL_TIMEOUT);
             String address = listenConnector.startListening(args);
 
             String[] cmds = LaunchRequestHandler.constructLaunchCommands(launchArguments, false, address);
@@ -98,9 +103,33 @@ public class LaunchWithDebuggingDelegate implements ILaunchDelegate {
                         if (runResponse.success) {
                             try {
                                 VirtualMachine vm = listenConnector.accept(args);
+                                vmHandler.connectVirtualMachine(vm);
                                 context.setDebugSession(new DebugSession(vm));
                                 logger.info("Launching debuggee in terminal console succeeded.");
                                 resultFuture.complete(response);
+                            } catch (TransportTimeoutException e) {
+                                int commandLength = StringUtils.length(launchArguments.cwd) + 1;
+                                for (String cmd : cmds) {
+                                    commandLength += StringUtils.length(cmd) + 1;
+                                }
+
+                                final int threshold = SystemUtils.IS_OS_WINDOWS ? 8092 : 32 * 1024;
+                                String errorMessage = String.format(launchInTerminalErrorFormat, e.toString());
+                                if (commandLength >= threshold) {
+                                    errorMessage = "Failed to launch debuggee in terminal. The possible reason is the command line too long. "
+                                            + "More details: " + e.toString();
+                                    logger.severe(errorMessage
+                                            + "\r\n"
+                                            + "The estimated command line length is " + commandLength + ". "
+                                            + "Try to enable shortenCommandLine option in the debug launch configuration.");
+                                }
+
+                                resultFuture.completeExceptionally(
+                                        new DebugException(
+                                                errorMessage,
+                                                ErrorCode.LAUNCH_IN_TERMINAL_FAILURE.getId()
+                                        )
+                                );
                             } catch (IOException | IllegalConnectorArgumentsException e) {
                                 resultFuture.completeExceptionally(
                                         new DebugException(
@@ -142,9 +171,11 @@ public class LaunchWithDebuggingDelegate implements ILaunchDelegate {
         return resultFuture;
     }
 
-    private Process launchInternalDebuggeeProcess(LaunchArguments launchArguments, IDebugAdapterContext context)
+    @Override
+    public Process launch(LaunchArguments launchArguments, IDebugAdapterContext context)
             throws IOException, IllegalConnectorArgumentsException, VMStartException {
         IVirtualMachineManagerProvider vmProvider = context.getProvider(IVirtualMachineManagerProvider.class);
+        vmHandler.setVmProvider(vmProvider);
 
         IDebugSession debugSession = DebugUtility.launch(
                 vmProvider.getVirtualMachineManager(),
@@ -154,43 +185,13 @@ public class LaunchWithDebuggingDelegate implements ILaunchDelegate {
                 Arrays.asList(launchArguments.modulePaths),
                 Arrays.asList(launchArguments.classPaths),
                 launchArguments.cwd,
-                LaunchRequestHandler.constructEnvironmentVariables(launchArguments));
+                LaunchRequestHandler.constructEnvironmentVariables(launchArguments),
+                launchArguments.javaExec);
         context.setDebugSession(debugSession);
+        vmHandler.connectVirtualMachine(debugSession.getVM());
 
         logger.info("Launching debuggee VM succeeded.");
         return debugSession.process();
-    }
-
-    @Override
-    public CompletableFuture<Response> launchInternally(LaunchArguments launchArguments, Response response, IDebugAdapterContext context) {
-        CompletableFuture<Response> resultFuture = new CompletableFuture<>();
-
-        try {
-            Process debugeeProcess = launchInternalDebuggeeProcess(launchArguments, context);
-
-            ProcessConsole debuggeeConsole = new ProcessConsole(debugeeProcess, "Debuggee", context.getDebuggeeEncoding());
-            debuggeeConsole.onStdout((output) -> {
-                // When DA receives a new OutputEvent, it just shows that on Debug Console and doesn't affect the DA's dispatching workflow.
-                // That means the debugger can send OutputEvent to DA at any time.
-                context.getProtocolServer().sendEvent(Events.OutputEvent.createStdoutOutput(output));
-            });
-
-            debuggeeConsole.onStderr((err) -> {
-                context.getProtocolServer().sendEvent(Events.OutputEvent.createStderrOutput(err));
-            });
-            debuggeeConsole.start();
-
-            resultFuture.complete(response);
-        } catch (IOException | IllegalConnectorArgumentsException | VMStartException e) {
-            resultFuture.completeExceptionally(
-                    new DebugException(
-                            String.format("Failed to launch debuggee VM. Reason: %s", e.toString()),
-                            ErrorCode.LAUNCH_FAILURE.getId()
-                    )
-            );
-        }
-
-        return resultFuture;
     }
 
     @Override

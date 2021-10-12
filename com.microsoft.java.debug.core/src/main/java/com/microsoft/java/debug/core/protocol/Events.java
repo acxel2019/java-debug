@@ -11,6 +11,9 @@
 
 package com.microsoft.java.debug.core.protocol;
 
+import com.google.gson.annotations.SerializedName;
+import com.microsoft.java.debug.core.protocol.Types.Source;
+
 /**
  * The event types defined by VSCode Debug Protocol.
  */
@@ -136,6 +139,11 @@ public class Events {
 
         public Category category;
         public String output;
+        public int variablesReference;
+        public Source source;
+        public int line;
+        public int column;
+        public Object data;
 
         /**
          * Constructor.
@@ -146,6 +154,17 @@ public class Events {
             this.output = output;
         }
 
+        /**
+         * Constructor.
+         */
+        public OutputEvent(Category category, String output, Source source, int line) {
+            super("output");
+            this.category = category;
+            this.output = output;
+            this.source = source;
+            this.line = line;
+        }
+
         public static OutputEvent createConsoleOutput(String output) {
             return new OutputEvent(Category.console, output);
         }
@@ -154,8 +173,22 @@ public class Events {
             return new OutputEvent(Category.stdout, output);
         }
 
+        /**
+         * Construct an stdout output event with source info.
+         */
+        public static OutputEvent createStdoutOutputWithSource(String output, Source source, int line) {
+            return new OutputEvent(Category.stdout, output, source, line);
+        }
+
         public static OutputEvent createStderrOutput(String output) {
             return new OutputEvent(Category.stderr, output);
+        }
+
+        /**
+         * Construct an stderr output event with source info.
+         */
+        public static OutputEvent createStderrOutputWithSource(String output, Source source, int line) {
+            return new OutputEvent(Category.stderr, output, source, line);
         }
 
         public static OutputEvent createTelemetryOutput(String output) {
@@ -210,6 +243,44 @@ public class Events {
             super("usernotification");
             this.notificationType = notifyType;
             this.message = message;
+        }
+    }
+
+    public static enum InvalidatedAreas {
+        @SerializedName("all")
+        ALL,
+        @SerializedName("stacks")
+        STACKS,
+        @SerializedName("threads")
+        THREADS,
+        @SerializedName("variables")
+        VARIABLES;
+    }
+
+    public static class InvalidatedEvent extends DebugEvent {
+        public InvalidatedAreas[] areas;
+        public long threadId;
+        public int frameId;
+
+        public InvalidatedEvent() {
+            super("invalidated");
+        }
+
+        public InvalidatedEvent(InvalidatedAreas area) {
+            super("invalidated");
+            this.areas = new InvalidatedAreas[]{area};
+        }
+
+        public InvalidatedEvent(InvalidatedAreas area, long threadId) {
+            super("invalidated");
+            this.areas = new InvalidatedAreas[]{area};
+            this.threadId = threadId;
+        }
+
+        public InvalidatedEvent(InvalidatedAreas area, int frameId) {
+            super("invalidated");
+            this.areas = new InvalidatedAreas[]{area};
+            this.frameId = frameId;
         }
     }
 }

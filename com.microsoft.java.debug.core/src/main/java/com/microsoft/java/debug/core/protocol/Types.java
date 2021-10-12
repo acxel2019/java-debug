@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright (c) 2017 Microsoft Corporation and others.
+* Copyright (c) 2017-2019 Microsoft Corporation and others.
 * All rights reserved. This program and the accompanying materials
 * are made available under the terms of the Eclipse Public License v1.0
 * which accompanies this distribution, and is available at
@@ -13,6 +13,8 @@ package com.microsoft.java.debug.core.protocol;
 
 import java.nio.file.Paths;
 
+import com.google.gson.annotations.SerializedName;
+
 /**
  * The data types defined by VSCode Debug Protocol.
  */
@@ -23,6 +25,7 @@ public class Types {
 
         /**
          * Constructs a message with the given information.
+         *
          * @param id
          *          message id
          * @param format
@@ -43,6 +46,7 @@ public class Types {
 
         /**
          * Constructs a StackFrame with the given information.
+         *
          * @param id
          *          the stack frame id
          * @param name
@@ -83,6 +87,7 @@ public class Types {
         public String value;
         public String type;
         public int variablesReference;
+        public int namedVariables;
         public int indexedVariables;
         public String evaluateName;
 
@@ -95,6 +100,14 @@ public class Types {
             this.type = type;
             this.variablesReference = rf;
             this.evaluateName = evaluateName;
+        }
+
+        /**
+         * Constructor.
+         */
+        public Variable(String name, String value) {
+            this.name = name;
+            this.value = value;
         }
     }
 
@@ -143,10 +156,31 @@ public class Types {
     }
 
     public static class Breakpoint {
+        /**
+         * An optional identifier for the breakpoint. It is needed if breakpoint events are used to update or remove breakpoints.
+         */
         public int id;
+        /**
+         * If true breakpoint could be set (but not necessarily at the desired location).
+         */
         public boolean verified;
+        /**
+         * The start line of the actual range covered by the breakpoint.
+         */
         public int line;
+        /**
+         * An optional message about the state of the breakpoint. This is shown to the user and can be used to explain why a breakpoint could not be verified.
+         */
         public String message;
+
+        public Breakpoint(boolean verified) {
+            this.verified = verified;
+        }
+
+        public Breakpoint(int id, boolean verified) {
+            this.id = id;
+            this.verified = verified;
+        }
 
         /**
          * Constructor.
@@ -191,10 +225,71 @@ public class Types {
         }
     }
 
+    public static enum DataBreakpointAccessType {
+        @SerializedName("read")
+        READ("read"),
+        @SerializedName("write")
+        WRITE("write"),
+        @SerializedName("readWrite")
+        READWRITE("readWrite");
+
+        String label;
+
+        DataBreakpointAccessType(String label) {
+            this.label = label;
+        }
+
+        public String label() {
+            return label;
+        }
+    }
+
+    public static class DataBreakpoint {
+        /**
+         * An id representing the data. This id is returned from the dataBreakpointInfo request.
+         */
+        public String dataId;
+        /**
+         * The access type of the data.
+         */
+        public DataBreakpointAccessType accessType;
+        /**
+         * An optional expression for conditional breakpoints.
+         */
+        public String condition;
+        /**
+         * An optional expression that controls how many hits of the breakpoint are ignored. The backend is expected to interpret the expression as needed.
+         */
+        public String hitCondition;
+
+        public DataBreakpoint(String dataId) {
+            this.dataId = dataId;
+        }
+
+        public DataBreakpoint(String dataId, DataBreakpointAccessType accessType) {
+            this.dataId = dataId;
+            this.accessType = accessType;
+        }
+
+        /**
+         * Constructor.
+         */
+        public DataBreakpoint(String dataId, DataBreakpointAccessType accessType, String condition, String hitCondition) {
+            this.dataId = dataId;
+            this.accessType = accessType;
+            this.condition = condition;
+            this.hitCondition = hitCondition;
+        }
+    }
+
     public static class CompletionItem {
         public String label;
         public String text;
         public String type;
+        /**
+         * A string that should be used when comparing this item with other items.
+         */
+        public String sortText;
 
         public int start;
         public int number;
@@ -228,6 +323,26 @@ public class Types {
                 new ExceptionBreakpointFilter(CAUGHT_EXCEPTION_FILTER_NAME, CAUGHT_EXCEPTION_FILTER_LABEL);
     }
 
+    public static enum ExceptionBreakMode {
+        @SerializedName("never")
+        NEVER,
+        @SerializedName("always")
+        ALWAYS,
+        @SerializedName("unhandled")
+        UNHANDLED,
+        @SerializedName("userUnhandled")
+        USERUNHANDLED
+    }
+
+    public static class ExceptionDetails {
+        public String message;
+        public String typeName;
+        public String fullTypeName;
+        public String evaluateName;
+        public String stackTrace;
+        public ExceptionDetails[] innerException;
+    }
+
     public static class Capabilities {
         public boolean supportsConfigurationDoneRequest;
         public boolean supportsHitConditionalBreakpoints;
@@ -240,6 +355,9 @@ public class Types {
         public boolean supportTerminateDebuggee;
         public boolean supportsDelayedStackTraceLoading;
         public boolean supportsLogPoints;
+        public boolean supportsExceptionInfoRequest;
         public ExceptionBreakpointFilter[] exceptionBreakpointFilters = new ExceptionBreakpointFilter[0];
+        public boolean supportsDataBreakpoints;
+        public boolean supportsClipboardContext;
     }
 }

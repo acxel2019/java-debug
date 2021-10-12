@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (c) 2017 Microsoft Corporation and others.
+ * Copyright (c) 2017-2020 Microsoft Corporation and others.
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -12,6 +12,7 @@
 package com.microsoft.java.debug.core.adapter;
 
 import java.nio.charset.Charset;
+import java.nio.file.Path;
 import java.util.Map;
 
 import com.microsoft.java.debug.core.IDebugSession;
@@ -49,6 +50,10 @@ public interface IDebugAdapterContext {
     boolean isClientLinesStartAt1();
 
     void setClientLinesStartAt1(boolean clientLinesStartAt1);
+
+    boolean isClientColumnsStartAt1();
+
+    void setClientColumnsStartAt1(boolean clientColumnsStartAt1);
 
     boolean isClientPathsAreUri();
 
@@ -109,4 +114,18 @@ public interface IDebugAdapterContext {
     Process getDebuggeeProcess();
 
     void setDebuggeeProcess(Process debuggeeProcess);
+
+    void setClasspathJar(Path classpathJar);
+
+    Path getClasspathJar();
+
+    void setArgsfile(Path argsfile);
+
+    Path getArgsfile();
+
+    IExceptionManager getExceptionManager();
+
+    IBreakpointManager getBreakpointManager();
+
+    IStepResultManager getStepResultManager();
 }

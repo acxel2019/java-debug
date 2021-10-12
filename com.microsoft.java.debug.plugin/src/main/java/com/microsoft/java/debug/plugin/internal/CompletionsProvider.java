@@ -21,7 +21,7 @@ import org.eclipse.core.runtime.CoreException;
 import org.eclipse.jdt.core.CompletionProposal;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IType;
-import org.eclipse.jdt.ls.core.internal.contentassist.CompletionProposalRequestor;
+import org.eclipse.jdt.core.ITypeRoot;
 import org.eclipse.jdt.ls.core.internal.handlers.JsonRpcHelpers;
 
 import com.microsoft.java.debug.core.Configuration;
@@ -49,9 +49,10 @@ public class CompletionsProvider implements ICompletionsProvider {
 
         try {
             IType type = resolveType(frame);
-            if (type != null && type.getCompilationUnit() != null) {
-                final int offset = JsonRpcHelpers.toOffset(type.getCompilationUnit().getBuffer(), frame.location().lineNumber(), 0);
-                CompletionProposalRequestor collector = new CompletionProposalRequestor(type.getCompilationUnit(), offset);
+            if (type != null) {
+                ITypeRoot r = type.getCompilationUnit() != null ? type.getCompilationUnit() : type.getClassFile();
+                final int offset = JsonRpcHelpers.toOffset(r.getBuffer(), frame.location().lineNumber(), 0);
+                CompletionProposalRequestor collector = new CompletionProposalRequestor(r, offset);
 
                 collector.setAllowsRequiredProposals(CompletionProposal.FIELD_REF, CompletionProposal.TYPE_REF, true);
                 collector.setAllowsRequiredProposals(CompletionProposal.FIELD_REF, CompletionProposal.TYPE_IMPORT, true);
@@ -68,7 +69,8 @@ public class CompletionsProvider implements ICompletionsProvider {
 
                 collector.setAllowsRequiredProposals(CompletionProposal.TYPE_REF, CompletionProposal.TYPE_REF, true);
 
-                type.codeComplete(snippet.toCharArray(), offset, snippet.length(), null, null, null, frame.location().method().isStatic(), collector);
+                int position = getInsertPosition(snippet, line, column);
+                type.codeComplete(snippet.toCharArray(), offset, position, null, null, null, frame.location().method().isStatic(), collector);
 
                 List<org.eclipse.lsp4j.CompletionItem> items = collector.getCompletionItems();
 
@@ -84,6 +86,17 @@ public class CompletionsProvider implements ICompletionsProvider {
         }
 
         return res;
+    }
+
+    private int getInsertPosition(String snippet, int line, int column) {
+        int lineInSnippet = context.isClientLinesStartAt1() ? line - 1 : line;
+        int offsetInSnippet = -1;
+        for (int i = 0; i < lineInSnippet; i++) {
+            offsetInSnippet = snippet.indexOf('\n', offsetInSnippet + 1);
+        }
+
+        offsetInSnippet++;
+        return offsetInSnippet + column + (context.isClientColumnsStartAt1() ?  -1 : 0);
     }
 
     private IType resolveType(StackFrame frame) throws CoreException, DebugException {
@@ -102,6 +115,11 @@ public class CompletionsProvider implements ICompletionsProvider {
         if (lspItem.getKind() != null) {
             item.type = lspItem.getKind().name().toLowerCase();
         }
+
+        if (lspItem.getSortText() != null) {
+            item.sortText = lspItem.getSortText();
+        }
+
         return item;
     }
 }
